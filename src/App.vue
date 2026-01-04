@@ -119,6 +119,7 @@ const copyAllStocks = () => {
   stockData.value.forEach(plate => {
     if (plate.stock_list) {
       plate.stock_list.forEach(stock => {
+        if (stock.secu_name.startsWith('ST') || stock.secu_name.startsWith('*ST')) return
         allNames.push(stock.secu_name)
       })
     }
@@ -257,17 +258,17 @@ onMounted(() => {
               <div class="col-name">简称</div>
               <div class="col-code">代码</div>
               <div class="col-num">板数</div>
-              <div class="col-price sortable" @click="toggleSort('last_px')" :class="{ active: sortConfig.key === 'last_px' }">
-                现价 <span class="sort-icon">{{ sortConfig.key === 'last_px' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
-              </div>
-              <div class="col-change sortable" @click="toggleSort('change')" :class="{ active: sortConfig.key === 'change' }">
-                涨幅 <span class="sort-icon">{{ sortConfig.key === 'change' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
-              </div>
               <div class="col-time sortable" @click="toggleSort('time')" :class="{ active: sortConfig.key === 'time' }">
                 涨停时间 <span class="sort-icon">{{ sortConfig.key === 'time' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
               </div>
               <div class="col-cmc sortable" @click="toggleSort('cmc')" :class="{ active: sortConfig.key === 'cmc' }">
                 流通市值 <span class="sort-icon">{{ sortConfig.key === 'cmc' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
+              </div>
+              <div class="col-change sortable" @click="toggleSort('change')" :class="{ active: sortConfig.key === 'change' }">
+                涨幅 <span class="sort-icon">{{ sortConfig.key === 'change' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
+              </div>
+              <div class="col-price sortable" @click="toggleSort('last_px')" :class="{ active: sortConfig.key === 'last_px' }">
+                现价 <span class="sort-icon">{{ sortConfig.key === 'last_px' ? (sortConfig.order === 'desc' ? '↓' : '↑') : '⇅' }}</span>
               </div>
             </div>
             
@@ -281,12 +282,12 @@ onMounted(() => {
                 <div class="col-num">
                   <span class="stock-tag">{{ stock.up_num || '1天1板' }}</span>
                 </div>
-                <div class="col-price">{{ stock.last_px.toFixed(2) }}</div>
+                <div class="col-time">{{ formatTime(stock.time) }}</div>
+                <div class="col-cmc">{{ formatCmc(stock.cmc) }}</div>
                 <div class="col-change" :class="{ 'up': stock.change > 0 }">
                   {{ stock.change > 0 ? '+' : '' }}{{ (stock.change * 100).toFixed(2) }}%
                 </div>
-                <div class="col-time">{{ formatTime(stock.time) }}</div>
-                <div class="col-cmc">{{ formatCmc(stock.cmc) }}</div>
+                <div class="col-price">{{ stock.last_px.toFixed(2) }}</div>
               </div>
               <div v-show="expandedStocks.has(stock.secu_code)" class="stock-expanded-content">
                 <div class="reason-label">涨停原因：</div>
@@ -593,21 +594,21 @@ input:checked + .slider:before {
   background: #fdf2f2;
 }
 
-.col-name { flex: 2; font-weight: bold; color: #333; display: flex; align-items: center; gap: 6px; }
+.col-name { flex: 1; font-weight: bold; color: #333; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .expand-icon { font-size: 0.6rem; color: #999; transition: transform 0.2s; width: 12px; }
-.col-code { flex: 1.5; color: #888; font-family: monospace; font-size: 0.85rem; }
-.col-num { flex: 1.5; text-align: left; }
-.col-price { flex: 1; text-align: right; font-weight: 700; }
-.col-change { flex: 1.2; text-align: right; font-weight: 700; }
-.col-time { flex: 1.5; text-align: right; color: #666; font-size: 0.85rem; }
-.col-cmc { flex: 1.5; text-align: right; color: #666; font-size: 0.85rem; }
+.col-code { flex: 1; color: #888; font-family: monospace; font-size: 0.85rem; text-align: center; }
+.col-num { flex: 1; text-align: center; }
+.col-price { flex: 1; text-align: center; font-weight: 700; color: #888; }
+.col-change { flex: 1; text-align: center; font-weight: 700; color: #888; }
+.col-time { flex: 1; text-align: center; color: #888; font-size: 0.85rem; }
+.col-cmc { flex: 1; text-align: center; color: #888; font-size: 0.85rem; }
 
 .sortable {
   cursor: pointer;
   user-select: none;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   gap: 4px;
 }
 
@@ -679,24 +680,34 @@ input:checked + .slider:before {
   .reason-text { color: #ddd; }
 }
 
-@media (max-width: 800px) {
-  .stock-list-header .col-time,
-  .stock-list-item .col-time,
+@media (max-width: 900px) {
+  .stock-list-header .col-code,
+  .stock-list-item .col-code,
   .stock-list-header .col-cmc,
   .stock-list-item .col-cmc {
     display: none;
   }
 }
 
-@media (max-width: 600px) {
-  .stock-list-header .col-num,
-  .stock-list-item .col-num {
+@media (max-width: 750px) {
+  .stock-list-header .col-price,
+  .stock-list-item .col-price {
     display: none;
   }
-  .col-name { flex: 2; }
-  .col-code { flex: 1.5; }
-  .col-price { flex: 1; }
-  .col-change { flex: 1.2; }
+}
+
+@media (max-width: 600px) {
+  .stock-list-header .col-change,
+  .stock-list-item .col-change {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .stock-list-header .col-time,
+  .stock-list-item .col-time {
+    display: none;
+  }
 }
 
 .loading-state, .error-state, .empty-state {
