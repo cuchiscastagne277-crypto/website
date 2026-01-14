@@ -2,10 +2,19 @@
 import { ref } from 'vue'
 import StockAnalysis from './components/StockAnalysis.vue'
 import SectorRotation from './components/SectorRotation.vue'
+import PlateRanking from './components/PlateRanking.vue'
+import PlateStockList from './components/PlateStockList.vue'
 
 const currentPage = ref('home')
+const stockAnalysisDate = ref(null)
+const selectedPlateName = ref(null)
+const previousPage = ref(null) // 记录上一个页面，用于返回
 
-const goToStockAnalysis = () => {
+const goToStockAnalysis = (date = null, fromPage = null) => {
+  stockAnalysisDate.value = date
+  if (fromPage) {
+    previousPage.value = fromPage
+  }
   currentPage.value = 'stock-analysis'
 }
 
@@ -13,8 +22,46 @@ const goToSectorRotation = () => {
   currentPage.value = 'sector-rotation'
 }
 
+const goToPlateRanking = () => {
+  currentPage.value = 'plate-ranking'
+  previousPage.value = null
+}
+
+const goToPlateStockList = (plateName) => {
+  selectedPlateName.value = plateName
+  previousPage.value = 'plate-ranking'
+  currentPage.value = 'plate-stock-list'
+}
+
 const goHome = () => {
   currentPage.value = 'home'
+  stockAnalysisDate.value = null
+  selectedPlateName.value = null
+  previousPage.value = null
+}
+
+const handleNavigateToAnalysis = (date) => {
+  goToStockAnalysis(date, 'plate-ranking')
+}
+
+const handleNavigateToPlateList = (plateName) => {
+  goToPlateStockList(plateName)
+}
+
+const handleBackFromAnalysis = () => {
+  if (previousPage.value === 'plate-ranking') {
+    goToPlateRanking()
+  } else {
+    goHome()
+  }
+}
+
+const handleBackFromPlateList = () => {
+  if (previousPage.value === 'plate-ranking') {
+    goToPlateRanking()
+  } else {
+    goHome()
+  }
 }
 </script>
 
@@ -27,7 +74,7 @@ const goHome = () => {
 
     <main class="main-content">
       <div class="card-container">
-        <div class="card" @click="goToStockAnalysis">
+        <div class="card" @click="() => goToStockAnalysis()">
           <div class="card-icon">📈</div>
           <h2 class="card-title">大涨股解读</h2>
           <p class="card-description">实时分析涨停股票，掌握市场热点。查看涨停梯队图和各板块涨停个股。</p>
@@ -36,7 +83,13 @@ const goHome = () => {
         <div class="card" @click="goToSectorRotation">
           <div class="card-icon">🔁</div>
           <h2 class="card-title">板块轮动</h2>
-          <p class="card-description">近 7 个交易日内各大板块涨幅排行（去除 ST 与“其他”板块）。横向显示每日板块涨幅。</p>
+          <p class="card-description">近 7 个交易日内各大板块涨幅排行（去除 ST 与"其他"板块）。横向显示每日板块涨幅。</p>
+          <button class="card-button">进入 →</button>
+        </div>
+        <div class="card" @click="goToPlateRanking">
+          <div class="card-icon">📊</div>
+          <h2 class="card-title">板块排行</h2>
+          <p class="card-description">显示所有板块近 20 个交易日的涨幅数据。按涨幅大于 1% 的时间从近到远排序。</p>
           <button class="card-button">进入 →</button>
         </div>
       </div>
@@ -44,10 +97,16 @@ const goHome = () => {
   </div>
 
   <div v-else-if="currentPage === 'stock-analysis'">
-    <StockAnalysis @back="goHome" />
+    <StockAnalysis :key="stockAnalysisDate || 'default'" :initial-date="stockAnalysisDate" @back="handleBackFromAnalysis" />
   </div>
   <div v-else-if="currentPage === 'sector-rotation'">
     <SectorRotation @back="goHome" />
+  </div>
+  <div v-else-if="currentPage === 'plate-ranking'">
+    <PlateRanking @back="goHome" @navigate-to-analysis="handleNavigateToAnalysis" @navigate-to-plate-list="handleNavigateToPlateList" />
+  </div>
+  <div v-else-if="currentPage === 'plate-stock-list'">
+    <PlateStockList :plate-name="selectedPlateName" @back="handleBackFromPlateList" />
   </div>
 </template>
 

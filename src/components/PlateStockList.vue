@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
-import { initDB, getStocksByPlate, getLimitInfoByStock, getAllLimitInfo, getStockTagsBatch, saveStockTag, getTaggedStocksByPlate, deleteStockTag } from '../utils/db.js'
+import { initDB, getStockTagsBatch, saveStockTag, getTaggedStocksByPlate, deleteStockTag, getStocksWithLimitRecordsByPlate, inspectDatabase, inspectTable } from '../utils/db.js'
 import StockLimitDetail from './StockLimitDetail.vue'
 
 const props = defineProps({
@@ -31,89 +31,74 @@ const loadPlateStocks = async () => {
   stocks.value = []
 
   try {
-    // 1. 获取该板块的所有股票（去重后）
-    const plateStocks = await getStocksByPlate(props.plateName)
+    await initDB()
     
-    if (!plateStocks || plateStocks.length === 0) {
+    // 从 stock_base 和 stock_limit_reason 表获取该板块的所有股票及其涨停记录
+    const stocksWithRecords = await getStocksWithLimitRecordsByPlate(props.plateName)
+    console.log(`获取到 ${stocksWithRecords.length} 只股票及其涨停记录`)
+    
+    const stockMap = new Map()
+    
+    if (stocksWithRecords && stocksWithRecords.length > 0) {
+      stocksWithRecords.forEach(stock => {
+        stockMap.set(stock.stockCode, {
+          stockCode: stock.stockCode,
+          stockName: stock.stockName,
+          dates: new Set(stock.dates),
+          limitDates: stock.limitDates || [],
+          limitCount: stock.limitCount || 0
+        })
+      })
+    }
+    
+    // 检查是否有数据
+    if (stockMap.size === 0) {
+      console.log(`板块 "${props.plateName}" 没有找到任何股票数据`)
+      stocks.value = []
       loading.value = false
       return
     }
-
-    // 2. 为每个股票查询涨停信息
-    const stockPromises = plateStocks.map(async (stock) => {
-      // 查询该股票的所有涨停记录
-      const limitInfos = await getLimitInfoByStock(stock.stockCode)
+    
+    console.log(`共找到 ${stockMap.size} 只股票`)
+    
+    // 转换为数组并处理数据
+    const stockPromises = Array.from(stockMap.values()).map(async (stock) => {
+      // 按日期倒序排列涨停记录
+      stock.limitDates.sort((a, b) => b.date.localeCompare(a.date))
       
-      // 计算涨停次数（只统计该板块内的涨停）
-      let limitCount = 0
-      const limitDates = []
-      const relevantDates = new Set(stock.dates) // 该股票在该板块出现的日期集合
-      
-      if (limitInfos && limitInfos.length > 0) {
-        // 过滤出该股票在该板块出现的日期的涨停记录
-        limitInfos.forEach(info => {
-          // 只统计该股票在该板块出现日期的涨停记录
-          // 涨停条件：日期匹配 且 有涨停原因（说明确实涨停了）
-          if (relevantDates.has(info.date)) {
-            // 检查是否确实是涨停：有 reason 或者 upNum > 0 或者 change >= 9.8%
-            const isLimit = info.reason || 
-                           (info.upNum && info.upNum > 0) || 
-                           (info.change && info.change >= 0.098)
-            
-            if (isLimit) {
-              limitCount++
-              limitDates.push({
-                date: info.date,
-                time: info.time,
-                reason: info.reason || '涨停',
-                upNum: info.upNum,
-                change: info.change,
-                cmc: info.cmc // 保存cmc以便后续使用
-              })
-            }
-          }
-        })
-        
-        // 按日期倒序排列
-        limitDates.sort((a, b) => b.date.localeCompare(a.date))
-      }
-
       // 获取最近涨停日期
-      const lastLimitDate = limitDates.length > 0 ? limitDates[0].date : null
-
+      const lastLimitDate = stock.limitDates.length > 0 ? stock.limitDates[0].date : null
+      
       // 获取最近涨停记录的流通市值（cmc）
-      // 优先从最近涨停记录中获取，如果没有则从所有涨停记录中查找最新的有cmc值的记录
       let cmc = null
-      if (limitDates.length > 0) {
-        // 从最近的涨停记录中获取cmc
-        const lastLimitRecord = limitDates[0]
+      if (stock.limitDates.length > 0) {
+        const lastLimitRecord = stock.limitDates[0]
         if (lastLimitRecord.cmc) {
           cmc = lastLimitRecord.cmc
-        } else if (limitInfos.length > 0) {
-          // 如果最近涨停记录没有cmc，从所有记录中找最新的有cmc的记录
-          const sortedInfos = limitInfos
-            .filter(info => info.cmc && relevantDates.has(info.date))
+        } else {
+          // 从所有涨停记录中找最新的有cmc的记录
+          const sortedInfos = stock.limitDates
+            .filter(info => info.cmc)
             .sort((a, b) => b.date.localeCompare(a.date))
           if (sortedInfos.length > 0) {
             cmc = sortedInfos[0].cmc
           }
         }
       }
-
+      
       // 获取该股票在板块中出现的最后日期
-      const lastPlateDate = stock.dates.length > 0 
-        ? stock.dates.sort().reverse()[0] 
-        : null
-
+      const datesArray = Array.from(stock.dates).sort().reverse()
+      const lastPlateDate = datesArray.length > 0 ? datesArray[0] : null
+      
       return {
         stockCode: stock.stockCode,
         stockName: stock.stockName,
-        limitCount,
+        limitCount: stock.limitCount,
         lastLimitDate,
-        limitDates,
-        allDates: stock.dates.sort().reverse(), // 该股票在板块中出现的所有日期（倒序）
+        limitDates: stock.limitDates,
+        allDates: datesArray,
         lastPlateDate,
-        cmc: cmc || null // 流通市值（单位：元）
+        cmc: cmc || null
       }
     })
 
@@ -377,8 +362,18 @@ const formatTimestamp = (timestamp) => {
 }
 
 
-onMounted(() => {
+// 调试：在控制台查看数据库（开发环境）
+onMounted(async () => {
   loadPlateStocks()
+  
+  // 开发环境：将调试函数挂载到 window，方便在控制台调用
+  if (import.meta.env.DEV) {
+    window.inspectDB = inspectDatabase
+    window.inspectTable = inspectTable
+    console.log('💡 调试提示:')
+    console.log('  - inspectDB() - 查看所有表数据')
+    console.log('  - inspectTable("表名") - 查看指定表')
+  }
 })
 </script>
 

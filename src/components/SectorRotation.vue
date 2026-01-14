@@ -1,13 +1,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { initDB, getPlateData, extractAndSaveAllData } from '../utils/db.js'
+import { initDB, getPlateData, extractAndSaveAllData, updatePlateContinuityRate } from '../utils/db.js'
 import PlateStockList from './PlateStockList.vue'
 
 const emit = defineEmits(['back'])
 
 const loading = ref(true)
 const error = ref(null)
-const dateData = ref([]) // array of { date: 'YYYYMMDD', plates: [{ name, change }] }
+const dateData = ref([]) // array of { date: 'YYYYMMDD', plates: [{ name, change, limitCount, maxUp, maxUpNum, continuityRate, limitStocks }] }
 const currentView = ref('rotation') // 'rotation' | 'stockList'
 const selectedPlateName = ref('')
 
@@ -18,6 +18,29 @@ const formatPct = (v) => {
 
 const formatDisplayDate = (yyyymmdd) => {
   return `${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6)}`
+}
+
+const formatRate = (r) => {
+  if (r === null || r === undefined || Number.isNaN(r)) return '--'
+  return (r * 100).toFixed(0) + '%'
+}
+
+const formatRateNumber = (r) => {
+  if (r === null || r === undefined || Number.isNaN(r)) return null
+  return String(Math.round(r * 100))
+}
+
+const extractLimitStockCodes = (p) => {
+  if (!p) return []
+  const list = p.stock_list ?? p.stocks ?? p.stockList ?? p.stocks_list
+  if (!Array.isArray(list) || list.length === 0) return []
+  const out = []
+  for (const s of list) {
+    if (!s) continue
+    const code = s.secu_code ?? s.code ?? s.stock_code
+    if (code) out.push(String(code))
+  }
+  return Array.from(new Set(out))
 }
 
 // deterministic color generator for plate names
@@ -263,6 +286,74 @@ const getPlateLimitCountsByDate = (plateName) => {
   }))
 } 
 
+const getPlateContinuityRatesByDate = (plateName) => {
+  if (dateData.value.length === 0) return []
+  const targetDates = dateData.value.slice(0, 7).map(dayData => dayData.date)
+
+  const dateDataMap = new Map()
+  dateData.value.forEach(dayData => {
+    dateDataMap.set(dayData.date, dayData.plates)
+  })
+
+  return targetDates.map(date => {
+    const plates = dateDataMap.get(date)
+    const plate = plates ? plates.find(p => p.name === plateName) : null
+    return {
+      date,
+      rate: plate ? (plate.continuityRate ?? null) : null
+    }
+  })
+}
+
+const ensureContinuityRatesForSevenDays = async () => {
+  if (dateData.value.length < 2) return
+
+  const updates = []
+  for (let i = 0; i < dateData.value.length - 1; i++) {
+    const today = dateData.value[i]
+    const yesterday = dateData.value[i + 1]
+
+    const yMap = new Map()
+    yesterday.plates.forEach(p => {
+      yMap.set(p.name, p)
+    })
+
+    for (const p of today.plates) {
+      // 先读数据库/缓存字段（已在 plate.continuityRate 上），有就不算
+      if (p.continuityRate !== null && p.continuityRate !== undefined) continue
+
+      const yp = yMap.get(p.name)
+      if (!yp) {
+        p.continuityRate = null
+        continue
+      }
+
+      const yCodes = yp.limitStocks || []
+      if (!yCodes.length) {
+        p.continuityRate = null
+        continue
+      }
+
+      const tSet = new Set(p.limitStocks || [])
+      let inter = 0
+      for (const c of yCodes) {
+        if (tSet.has(c)) inter++
+      }
+      const rate = inter / yCodes.length
+      p.continuityRate = rate
+
+      // 写回数据库（下次先读 DB，不重复计算）
+      updates.push(
+        updatePlateContinuityRate(today.date, p.name, rate).catch(() => null)
+      )
+    }
+  }
+
+  if (updates.length) {
+    await Promise.all(updates)
+  }
+}
+
 // Fetch until we have 7 dates with valid plate data or reach a reasonable lookback limit
 // 为了支持每个列都能显示向前数7个工作日的涨停数，我们需要加载更多历史数据（至少14个工作日）
 const fetchForSevenValidDates = async () => {
@@ -289,15 +380,18 @@ const fetchForSevenValidDates = async () => {
       const apiDate = dt.toISOString().split('T')[0].replace(/-/g, '')
       
       // 先查询本地数据库
-      let plateData = null
+      let plateDataResult = null
       try {
-        plateData = await getPlateData(apiDate)
-        if (plateData && Array.isArray(plateData) && plateData.length > 0) {
+        plateDataResult = await getPlateData(apiDate)
+        if (plateDataResult && plateDataResult.plateData && Array.isArray(plateDataResult.plateData) && plateDataResult.plateData.length > 0) {
           console.log('SectorRotation: 从本地数据库加载数据', apiDate)
         }
       } catch (e) {
         console.warn('从本地数据库查询失败', apiDate, e)
       }
+      
+      let plateData = plateDataResult?.plateData || null
+      let plateStats = plateDataResult?.stats || {}
 
       // 如果本地数据库没有数据，则查询网络
       if (!plateData || !Array.isArray(plateData) || plateData.length === 0) {
@@ -314,6 +408,12 @@ const fetchForSevenValidDates = async () => {
             try {
               await extractAndSaveAllData(apiDate, json)
               console.log('SectorRotation: 已保存数据到数据库', apiDate)
+              // 重新读取，拿到合并后的统计字段（maxUp/maxUpNum 等）
+              const updatedResult = await getPlateData(apiDate)
+              if (updatedResult) {
+                plateData = updatedResult.plateData
+                plateStats = updatedResult.stats || {}
+              }
             } catch (saveError) {
               console.warn('保存数据到数据库失败', apiDate, saveError)
               // 即使保存失败，也继续使用数据
@@ -333,8 +433,29 @@ const fetchForSevenValidDates = async () => {
           .sort((a, b) => (b.change ?? -Infinity) - (a.change ?? -Infinity))
 
         if (plates.length > 0) {
-          // attach limitCount extracted from original plate objects (use raw)
-          const normalized = plates.map(p => ({ name: p.name, change: p.change, limitCount: extractLimitCount(p.raw) }))
+          // attach enriched fields (limitCount / maxUp / continuityRate) from DB stats or raw
+          const normalized = plates.map(p => {
+            const stats = plateStats?.[p.name] || {}
+            const raw = p.raw
+
+            const limitCount =
+              (raw?.plate_stock_up_num ?? stats?.plate_stock_up_num ?? extractLimitCount(raw) ?? 0)
+
+            const maxUp = raw?.maxUp ?? stats?.maxUp ?? null
+            const maxUpNum = raw?.maxUpNum ?? stats?.maxUpNum ?? null
+            const continuityRate = raw?.continuityRate ?? stats?.continuityRate ?? null
+            const limitStocks = extractLimitStockCodes(raw)
+
+            return {
+              name: p.name,
+              change: p.change,
+              limitCount,
+              maxUp,
+              maxUpNum,
+              continuityRate,
+              limitStocks
+            }
+          })
           console.log('SectorRotation: normalized plates for', apiDate, normalized.slice(0, 6))
           dateData.value.push({ date: apiDate, plates: normalized })
         }
@@ -347,6 +468,9 @@ const fetchForSevenValidDates = async () => {
   
   // 按照日期倒序排列（最新的在前）
   dateData.value.sort((a, b) => b.date.localeCompare(a.date))
+
+  // 计算/补齐近 7 天连板率：先用 DB，DB 没有再计算并写回 DB
+  await ensureContinuityRatesForSevenDays()
 
   // compute frequency stats once we have all dateData
   computeNameCounts()
@@ -402,6 +526,7 @@ onMounted(() => {
 
               <div class="pname">{{ p.name }}</div>
               <div class="pchg" :style="{ color: p.change > 0 ? '#e63946' : (p.change < 0 ? '#16a34a' : '#6b7280') }">{{ formatPct(p.change) }}</div>
+              <div v-if="p.maxUp" class="max-up" :title="'最高连板：' + p.maxUp">最高：{{ p.maxUp }}</div>
 
               <!-- 近七天涨停数列表 - 紧凑显示（只显示数字） -->
               <div class="limit-counts-list">
@@ -414,6 +539,21 @@ onMounted(() => {
                   <span class="limit-value" :class="{ 'has-limit-value': dayInfo.count > 0 }">{{ dayInfo.count }}</span>
                 </div>
               </div> 
+
+              <!-- 近七天连板率 - 先读 DB，无则计算并写回 -->
+              <div class="continuity-rates-list">
+                <div
+                  v-for="dayInfo in getPlateContinuityRatesByDate(p.name)"
+                  :key="dayInfo.date"
+                  class="rate-item"
+                  :class="{ 'current-day': dayInfo.date === d.date }"
+                  :title="formatDisplayDate(dayInfo.date) + ': 连板率 ' + formatRate(dayInfo.rate)">
+                  <span v-if="formatRateNumber(dayInfo.rate) === null" class="rate-value rate-na">--</span>
+                  <span v-else class="rate-value has-rate">
+                    <span class="rate-num">{{ formatRateNumber(dayInfo.rate) }}</span><span class="rate-sym">%</span>
+                  </span>
+                </div>
+              </div>
             </li>
           </ol>
         </div> 
@@ -479,8 +619,8 @@ onMounted(() => {
   padding-bottom: 10px;
 }
 .day-column {
-  min-width: 160px; /* narrower columns */
-  max-width: 180px;
+  min-width: 260px; /* wider: fit 7-day counts + 7-day rates without wrapping */
+  max-width: 320px;
   background: rgba(255,255,255,0.95);
   border-radius: 8px;
   padding: 0; /* let rows touch container edges so it feels like a sheet */
@@ -518,6 +658,7 @@ onMounted(() => {
   text-align: center;
   cursor: pointer;
   transition: all 0.2s ease;
+  height: 148px; /* make every cell same height */
 } 
 
 .plate-item:hover {
@@ -555,25 +696,41 @@ onMounted(() => {
 
 .pname { display: block; padding: 0; font-weight: 700; color: #000000; text-align: center; font-size: 0.98rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; width: 100%; }
 .pchg { font-weight: 700; text-align: center; font-size: 0.95rem; width: 100%; margin-top: 4px; } /* change color follows plate color */
+.max-up {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #334155;
+  width: 100%;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  height: 18px; /* lock row height to keep alignment */
+  line-height: 18px;
+}
 
 /* 近七天涨停数列表 - 紧凑显示（只显示数字） */
 .limit-counts-list {
   margin-top: 3px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
+  flex-wrap: nowrap; /* align with continuity-rate row */
+  gap: 1px;
   width: 100%;
   justify-content: center;
   align-items: center;
+  overflow-x: auto; /* if too tight, scroll instead of wrapping */
+  scrollbar-width: none; /* Firefox */
 }
+
+.limit-counts-list::-webkit-scrollbar { display: none; } /* WebKit */
 
 .limit-count-item {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
+  min-width: 24px; /* keep same width as rate-item for vertical alignment */
   height: 18px;
-  padding: 0 4px;
+  padding: 0 2px;
   background: rgba(248, 250, 252, 0.8);
   border-radius: 3px;
   transition: all 0.15s;
@@ -596,9 +753,10 @@ onMounted(() => {
 .limit-value {
   color: #64748b;
   font-weight: 600;
-  font-size: 0.7rem;
+  font-size: 0.66rem;
   text-align: center;
   line-height: 1;
+  white-space: nowrap;
 }
 
 .limit-count-item.current-day .limit-value {
@@ -614,6 +772,79 @@ onMounted(() => {
 .limit-count-item.current-day .limit-value.has-limit-value {
   color: #2563eb;
   font-weight: 700;
+}
+
+/* 近七天连板率 - 紧凑显示 */
+.continuity-rates-list {
+  margin-top: 2px;
+  display: flex;
+  flex-wrap: nowrap; /* prefer single line */
+  gap: 1px;
+  width: 100%;
+  justify-content: center;
+  align-items: center;
+  overflow-x: auto; /* if too tight, scroll instead of wrapping */
+  scrollbar-width: none; /* Firefox */
+}
+
+.continuity-rates-list::-webkit-scrollbar { display: none; } /* WebKit */
+
+.rate-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px; /* match limit-count-item for alignment */
+  height: 18px;
+  padding: 0 2px; /* tighter padding */
+  background: rgba(248, 250, 252, 0.8);
+  border-radius: 3px;
+  border: 1px solid transparent;
+  cursor: help;
+  transition: all 0.15s;
+}
+
+.rate-item:hover {
+  background: rgba(255, 255, 255, 0.95);
+  transform: scale(1.06);
+  z-index: 5;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.rate-item.current-day {
+  background: rgba(59, 130, 246, 0.22);
+  border: 1px solid rgba(59, 130, 246, 0.45);
+}
+
+.rate-value {
+  color: #64748b;
+  font-weight: 700;
+  font-size: 0.56rem; /* base smaller */
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.rate-item.current-day .rate-value {
+  color: #2563eb;
+}
+
+.rate-value.has-rate {
+  color: #111827;
+}
+
+.rate-na {
+  color: #64748b;
+}
+
+.rate-num {
+  font-size: 0.62rem; /* number slightly bigger than % */
+  font-weight: 800;
+}
+
+.rate-sym {
+  margin-left: 1px;
+  font-size: 0.48rem; /* % smaller */
+  font-weight: 800;
+  opacity: 0.75;
 }
 
 /* bucket-based visual emphasis */

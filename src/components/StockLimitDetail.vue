@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { initDB, getLimitInfoByStock, getStockDetailNotes, saveStockDetailNote, updateStockDetailNote, deleteStockDetailNote } from '../utils/db.js'
+import { initDB, getLimitRecordsByStock, getStockDetailNotes, saveStockDetailNote, updateStockDetailNote, deleteStockDetailNote } from '../utils/db.js'
 
 const props = defineProps({
   stockCode: {
@@ -31,30 +31,30 @@ const loadStockLimitRecords = async () => {
 
   try {
     await initDB()
-    // 查询该股票的所有涨停记录
-    const limitInfos = await getLimitInfoByStock(props.stockCode)
+    // 查询该股票的所有涨停记录（从新表）
+    const limitRecordList = await getLimitRecordsByStock(props.stockCode)
     
-    if (!limitInfos || limitInfos.length === 0) {
+    if (!limitRecordList || limitRecordList.length === 0) {
       loading.value = false
       return
     }
 
     // 转换数据格式并按日期倒序排序
-    const records = limitInfos
-      .filter(info => {
+    const records = limitRecordList
+      .filter(record => {
         // 只显示确实涨停的记录：有 reason 或者 upNum > 0 或者 change >= 9.8%
-        return info.reason || 
-               (info.upNum && info.upNum > 0) || 
-               (info.change && info.change >= 0.098)
+        return record.reason || 
+               (record.upNum && record.upNum > 0) || 
+               (record.change && record.change >= 0.098)
       })
-      .map(info => ({
-        date: info.date,
-        time: info.time || null,
-        upNum: info.upNum || null,
-        reason: info.reason || '涨停',
-        change: info.change || null
+      .map(record => ({
+        date: record.date,
+        time: record.time || null,
+        upNum: record.upNum || null,
+        reason: record.reason || '涨停',
+        change: record.change || null
       }))
-      .sort((a, b) => b.date.localeCompare(a.date)) // 按日期倒序
+      // getLimitRecordsByStock 已经按日期倒序排序了
 
     limitRecords.value = records
   } catch (e) {
