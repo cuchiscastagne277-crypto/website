@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
 import { initDB, getPlateData, extractAndSaveAllData, getStocksWithLimitRecordsByPlate, updatePlateContinuityRate } from '../utils/db.js'
+import { getTradingDays, getClsSignature, fetchPlateUpDownAnalysis, getTodayYYYYMMDD } from '../utils/clsApi.js'
 
 const emit = defineEmits(['back', 'navigate-to-analysis', 'navigate-to-plate-list'])
 
@@ -96,7 +97,6 @@ const fetchTwentyTradingDays = async () => {
   error.value = null
   dateData.value = []
 
-  // 初始化数据库
   try {
     await initDB()
   } catch (e) {
@@ -106,104 +106,114 @@ const fetchTwentyTradingDays = async () => {
     return
   }
 
-  let attempts = 0
-  const maxLookbackDays = 50
-  let dt = new Date()
+  const todayStr = getTodayYYYYMMDD()
+  let dateList = []
 
-  while (dateData.value.length < 20 && attempts < maxLookbackDays) {
-    // skip weekends
-    const day = dt.getDay()
-    if (day !== 0 && day !== 6) {
-      const apiDate = dt.toISOString().split('T')[0].replace(/-/g, '')
-      
-      // 先查询本地数据库
-      let plateDataResult = null
+  try {
+    const end = new Date()
+    const start = new Date()
+    start.setDate(start.getDate() - 60)
+    const startStr = start.toISOString().split('T')[0]
+    const endStr = end.toISOString().split('T')[0]
+    dateList = (await getTradingDays(startStr, endStr)).slice(0, 20)
+  } catch (e) {
+    console.warn('getTradingDays 失败，回退到本地推算日期', e)
+    let dt = new Date()
+    let attempts = 0
+    while (dateList.length < 20 && attempts < 50) {
+      const day = dt.getDay()
+      if (day !== 0 && day !== 6) {
+        dateList.push(dt.toISOString().split('T')[0].replace(/-/g, ''))
+      }
+      dt = getPrevDate(dt)
+      attempts++
+    }
+  }
+
+  let signature = null
+  const needFetchDates = []
+
+  for (const apiDate of dateList) {
+    const isToday = apiDate === todayStr
+    let plateData = null
+    let plateStats = {}
+
+    if (!isToday) {
       try {
-        plateDataResult = await getPlateData(apiDate)
-        if (plateDataResult && plateDataResult.plateData && Array.isArray(plateDataResult.plateData) && plateDataResult.plateData.length > 0) {
+        const plateDataResult = await getPlateData(apiDate)
+        if (plateDataResult?.plateData?.length > 0) {
           console.log('PlateRanking: 从本地数据库加载数据', apiDate)
+          plateData = plateDataResult.plateData
+          plateStats = plateDataResult.stats || {}
         }
       } catch (e) {
         console.warn('从本地数据库查询失败', apiDate, e)
       }
-      
-      let plateData = plateDataResult?.plateData || null
-      let plateStats = plateDataResult?.stats || {}
-
-      // 如果本地数据库没有数据，则查询网络
-      if (!plateData || !Array.isArray(plateData) || plateData.length === 0) {
-        const targetUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${apiDate}`
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
-
-        try {
-          const res = await fetch(proxyUrl)
-          const json = await res.json()
-          if (json && json.code === 200 && Array.isArray(json.data?.plate_stock) && json.data.plate_stock.length > 0) {
-            plateData = json.data.plate_stock
-            
-            // 保存到数据库（会自动计算涨停板数量和最高板数）
-            try {
-              await extractAndSaveAllData(apiDate, json)
-              console.log('PlateRanking: 已保存数据到数据库', apiDate)
-              
-              // 重新读取数据以获取统计数据
-              const updatedResult = await getPlateData(apiDate)
-              if (updatedResult) {
-                plateData = updatedResult.plateData
-                plateStats = updatedResult.stats || {}
-              }
-            } catch (saveError) {
-              console.warn('保存数据到数据库失败', apiDate, saveError)
-            }
-          }
-        } catch (e) {
-          console.warn('网络请求失败', apiDate, e)
-        }
-      }
-
-      // 处理板块数据
-      if (plateData && Array.isArray(plateData) && plateData.length > 0) {
-        const plates = plateData
-          .filter(p => p.secu_name)
-          .filter(p => {
-            // 过滤掉 ST 和 "其他" 板块
-            const name = p.secu_name
-            if (!name) return false
-            // 检查是否包含 ST（不区分大小写）
-            if (name.toUpperCase().includes('ST')) return false
-            // 检查是否是 "其他" 板块
-            if (name === '其他' || name === '其它') return false
-            return true
-          })
-          .map(p => {
-            const plateName = p.secu_name
-            const stats = plateStats[plateName] || {}
-            return {
-              name: plateName, 
-              change: extractChange(p), 
-              limitCount: stats.limitCount !== undefined ? stats.limitCount : extractLimitCount(p), // 优先使用统计数据
-              maxUpNum: stats.maxUpNum || null, // 最高板数
-              raw: p 
-            }
-          })
-
-        if (plates.length > 0) {
-          dateData.value.push({ date: apiDate, plates })
-        }
-      }
     }
 
-    dt = getPrevDate(dt)
-    attempts++
+    if (!plateData || !Array.isArray(plateData) || plateData.length === 0) {
+      needFetchDates.push(apiDate)
+    } else {
+      pushPlateDay(apiDate, plateData, plateStats)
+    }
   }
-  
-  // 按照日期倒序排列（最新的在前）
+
+  if (needFetchDates.length > 0) {
+    try {
+      const firstUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${needFetchDates[0]}`
+      signature = await getClsSignature(firstUrl)
+    } catch (e) {
+      console.warn('获取签名失败', e)
+      error.value = '获取签名失败'
+    }
+
+    for (const apiDate of needFetchDates) {
+      if (!signature) continue
+      try {
+        const json = await fetchPlateUpDownAnalysis({ date: apiDate, upLimit: 1, signature })
+        if (json?.data?.plate_stock?.length > 0) {
+          await extractAndSaveAllData(apiDate, json)
+          console.log('PlateRanking: 已保存数据到数据库', apiDate)
+          const updatedResult = await getPlateData(apiDate)
+          const plateData = updatedResult?.plateData || json.data.plate_stock
+          const plateStats = updatedResult?.stats || {}
+          pushPlateDay(apiDate, plateData, plateStats)
+        }
+      } catch (e) {
+        console.warn('网络请求失败', apiDate, e)
+      }
+    }
+  }
+
   dateData.value.sort((a, b) => b.date.localeCompare(a.date))
-  
-  // 提取所有板块并构建数据结构（异步，需要计算连板率）
   await buildAllPlates()
-  
   loading.value = false
+}
+
+function pushPlateDay(apiDate, plateData, plateStats) {
+  const plates = plateData
+    .filter(p => p.secu_name)
+    .filter(p => {
+      const name = p.secu_name
+      if (!name) return false
+      if (name.toUpperCase().includes('ST')) return false
+      if (name === '其他' || name === '其它') return false
+      return true
+    })
+    .map(p => {
+      const plateName = p.secu_name
+      const stats = plateStats[plateName] || {}
+      return {
+        name: plateName,
+        change: extractChange(p),
+        limitCount: stats.limitCount !== undefined ? stats.limitCount : extractLimitCount(p),
+        maxUpNum: stats.maxUpNum ?? null,
+        raw: p
+      }
+    })
+  if (plates.length > 0) {
+    dateData.value.push({ date: apiDate, plates })
+  }
 }
 
 // 构建所有板块的数据结构

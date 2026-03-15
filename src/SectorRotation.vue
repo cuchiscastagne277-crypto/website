@@ -1,5 +1,11 @@
 <script setup>
+/**
+ * 旧版板块轮动页（无 DB 时也可用）。App 当前使用 components/SectorRotation.vue。
+ * 已对齐 CLS 接口：getTradingDays + 当天不读 DB 直接请求 / 非当天先读 DB。
+ */
 import { ref, onMounted } from 'vue'
+import { initDB, getPlateData, extractAndSaveAllData } from './utils/db.js'
+import { getTradingDays, getClsSignature, fetchPlateUpDownAnalysis, getTodayYYYYMMDD } from './utils/clsApi.js'
 
 const loading = ref(true)
 const error = ref(null)
@@ -221,53 +227,107 @@ const getColorByFrequency = (name) => {
   return { bg, text, border, ratio: r }
 } 
 
-// Fetch until we have 7 dates with valid plate data or reach a reasonable lookback limit
+function pushSectorDay(apiDate, plateData, plateStats = {}) {
+  const plates = plateData
+    .filter(p => p.secu_name && !p.secu_name.startsWith('ST') && !p.secu_name.startsWith('*ST') && !p.secu_name.includes('其他'))
+    .map(p => ({ name: p.secu_name, change: p.change, raw: p }))
+    .sort((a, b) => (b.change ?? -Infinity) - (a.change ?? -Infinity))
+  if (plates.length === 0) return
+  const normalized = plates.map(p => ({
+    name: p.name,
+    change: p.change,
+    limitCount: plateStats[p.name]?.plate_stock_up_num ?? extractLimitCount(p.raw)
+  }))
+  dateData.value.push({ date: apiDate, plates: normalized })
+}
+
 const fetchForSevenValidDates = async () => {
   loading.value = true
   error.value = null
   dateData.value = []
 
-  let attempts = 0
-  const maxLookbackDays = 40
-  let dt = new Date()
+  try {
+    await initDB()
+  } catch (e) {
+    console.error('数据库初始化失败:', e)
+    error.value = '数据库初始化失败'
+    loading.value = false
+    return
+  }
 
-  while (dateData.value.length < 7 && attempts < maxLookbackDays) {
-    // skip weekends immediately
-    const day = dt.getDay()
-    if (day !== 0 && day !== 6) {
-      const apiDate = dt.toISOString().split('T')[0].replace(/-/g, '')
-      const targetUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${apiDate}`
-      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
+  const todayStr = getTodayYYYYMMDD()
+  let dateList = []
 
+  try {
+    const end = new Date()
+    const start = new Date()
+    start.setDate(start.getDate() - 30)
+    dateList = (await getTradingDays(start.toISOString().split('T')[0], end.toISOString().split('T')[0])).slice(0, 7)
+  } catch (e) {
+    console.warn('getTradingDays 失败，回退到本地推算', e)
+    let dt = new Date()
+    let attempts = 0
+    while (dateList.length < 7 && attempts < 40) {
+      const day = dt.getDay()
+      if (day !== 0 && day !== 6) dateList.push(dt.toISOString().split('T')[0].replace(/-/g, ''))
+      dt = getPrevDate(dt)
+      attempts++
+    }
+  }
+
+  const needFetchDates = []
+
+  for (const apiDate of dateList) {
+    const isToday = apiDate === todayStr
+    let plateData = null
+    let plateStats = {}
+
+    if (!isToday) {
       try {
-        const res = await fetch(proxyUrl)
-        const json = await res.json()
-        if (json && json.code === 200 && Array.isArray(json.data?.plate_stock) && json.data.plate_stock.length > 0) {
-          // filter out ST and '其他'
-          const plates = json.data.plate_stock
-            .filter(p => p.secu_name && !p.secu_name.startsWith('ST') && !p.secu_name.startsWith('*ST') && !p.secu_name.includes('其他'))
-            .map(p => ({ name: p.secu_name, change: p.change, raw: p }))
-            .sort((a, b) => (b.change ?? -Infinity) - (a.change ?? -Infinity))
-
-          if (plates.length > 0) {
-            // attach limitCount extracted from original plate objects (use raw)
-            const normalized = plates.map(p => ({ name: p.name, change: p.change, limitCount: extractLimitCount(p.raw) }))
-            console.log('SectorRotation: normalized plates for', apiDate, normalized.slice(0, 6))
-            dateData.value.push({ date: apiDate, plates: normalized })
-          }
+        const r = await getPlateData(apiDate)
+        if (r?.plateData?.length > 0) {
+          plateData = r.plateData
+          plateStats = r.stats || {}
         }
       } catch (e) {
-        console.warn('fetch failed for', apiDate, e)
+        console.warn('从本地数据库查询失败', apiDate, e)
       }
     }
 
-    dt = getPrevDate(dt)
-    attempts++
+    if (plateData?.length > 0) {
+      pushSectorDay(apiDate, plateData, plateStats)
+    } else {
+      needFetchDates.push(apiDate)
+    }
   }
 
-  // compute frequency stats once we have all dateData
-  computeNameCounts()
+  if (needFetchDates.length > 0) {
+    let signature = null
+    try {
+      signature = await getClsSignature(`https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${needFetchDates[0]}`)
+    } catch (e) {
+      console.warn('获取签名失败', e)
+      error.value = '获取签名失败'
+    }
+    for (const apiDate of needFetchDates) {
+      if (!signature) continue
+      try {
+        const json = await fetchPlateUpDownAnalysis({ date: apiDate, upLimit: 1, signature })
+        if (json?.data?.plate_stock?.length > 0) {
+          await extractAndSaveAllData(apiDate, json)
+          const updated = await getPlateData(apiDate)
+          const plateData = updated?.plateData || json.data.plate_stock
+          const plateStats = updated?.stats || {}
+          pushSectorDay(apiDate, plateData, plateStats)
+        }
+      } catch (e) {
+        console.warn('网络请求失败', apiDate, e)
+      }
+    }
+  }
 
+  dateData.value.sort((a, b) => b.date.localeCompare(a.date))
+  computeNameCounts()
   loading.value = false
 }
 

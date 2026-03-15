@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { initDB, getPlateData, extractAndSaveAllData, updatePlateContinuityRate } from '../utils/db.js'
+import { getTradingDays, getClsSignature, fetchPlateUpDownAnalysis, getTodayYYYYMMDD } from '../utils/clsApi.js'
 import PlateStockList from './PlateStockList.vue'
 
 const emit = defineEmits(['back'])
@@ -354,127 +355,131 @@ const ensureContinuityRatesForSevenDays = async () => {
   }
 }
 
-// Fetch until we have 7 dates with valid plate data or reach a reasonable lookback limit
-// 为了支持每个列都能显示向前数7个工作日的涨停数，我们需要加载更多历史数据（至少14个工作日）
+// 将 plateData + plateStats 转为 dateData 一条
+function pushSectorDay(apiDate, plateData, plateStats) {
+  const plates = plateData
+    .filter(p => p.secu_name && !p.secu_name.startsWith('ST') && !p.secu_name.startsWith('*ST') && !p.secu_name.includes('其他'))
+    .map(p => ({ name: p.secu_name, change: p.change, raw: p }))
+    .sort((a, b) => (b.change ?? -Infinity) - (a.change ?? -Infinity))
+
+  if (plates.length === 0) return
+
+  const normalized = plates.map(p => {
+    const stats = plateStats?.[p.name] || {}
+    const raw = p.raw
+    const limitCount = (raw?.plate_stock_up_num ?? stats?.plate_stock_up_num ?? extractLimitCount(raw) ?? 0)
+    const maxUp = raw?.maxUp ?? stats?.maxUp ?? null
+    const maxUpNum = raw?.maxUpNum ?? stats?.maxUpNum ?? null
+    const continuityRate = raw?.continuityRate ?? stats?.continuityRate ?? null
+    const limitStocks = extractLimitStockCodes(raw)
+    return {
+      name: p.name,
+      change: p.change,
+      limitCount,
+      maxUp,
+      maxUpNum,
+      continuityRate,
+      limitStocks
+    }
+  })
+  dateData.value.push({ date: apiDate, plates: normalized })
+}
+
+// Fetch 7 个交易日数据：当天不读 DB 直接请求；非当天先读 DB，无再请求
 const fetchForSevenValidDates = async () => {
   loading.value = true
   error.value = null
   dateData.value = []
 
-  // 初始化数据库
   try {
     await initDB()
   } catch (e) {
     console.error('数据库初始化失败:', e)
     error.value = '数据库初始化失败'
+    loading.value = false
+    return
   }
 
-  let attempts = 0
-  const maxLookbackDays = 40
-  let dt = new Date()
+  const todayStr = getTodayYYYYMMDD()
+  let dateList = []
 
-  while (dateData.value.length < 7 && attempts < maxLookbackDays) {
-    // skip weekends immediately
-    const day = dt.getDay()
-    if (day !== 0 && day !== 6) {
-      const apiDate = dt.toISOString().split('T')[0].replace(/-/g, '')
-      
-      // 先查询本地数据库
-      let plateDataResult = null
+  try {
+    const end = new Date()
+    const start = new Date()
+    start.setDate(start.getDate() - 30)
+    const startStr = start.toISOString().split('T')[0]
+    const endStr = end.toISOString().split('T')[0]
+    dateList = (await getTradingDays(startStr, endStr)).slice(0, 7)
+  } catch (e) {
+    console.warn('getTradingDays 失败，回退到本地推算', e)
+    let dt = new Date()
+    let attempts = 0
+    while (dateList.length < 7 && attempts < 40) {
+      const day = dt.getDay()
+      if (day !== 0 && day !== 6) dateList.push(dt.toISOString().split('T')[0].replace(/-/g, ''))
+      dt = getPrevDate(dt)
+      attempts++
+    }
+  }
+
+  const needFetchDates = []
+
+  for (const apiDate of dateList) {
+    const isToday = apiDate === todayStr
+    let plateData = null
+    let plateStats = {}
+
+    if (!isToday) {
       try {
-        plateDataResult = await getPlateData(apiDate)
-        if (plateDataResult && plateDataResult.plateData && Array.isArray(plateDataResult.plateData) && plateDataResult.plateData.length > 0) {
+        const plateDataResult = await getPlateData(apiDate)
+        if (plateDataResult?.plateData?.length > 0) {
           console.log('SectorRotation: 从本地数据库加载数据', apiDate)
+          plateData = plateDataResult.plateData
+          plateStats = plateDataResult.stats || {}
         }
       } catch (e) {
         console.warn('从本地数据库查询失败', apiDate, e)
       }
-      
-      let plateData = plateDataResult?.plateData || null
-      let plateStats = plateDataResult?.stats || {}
-
-      // 如果本地数据库没有数据，则查询网络
-      if (!plateData || !Array.isArray(plateData) || plateData.length === 0) {
-        const targetUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${apiDate}`
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
-
-        try {
-          const res = await fetch(proxyUrl)
-          const json = await res.json()
-          if (json && json.code === 200 && Array.isArray(json.data?.plate_stock) && json.data.plate_stock.length > 0) {
-            plateData = json.data.plate_stock
-            
-            // 保存到数据库（包括板块数据、板块-股票关系、股票涨停信息）
-            try {
-              await extractAndSaveAllData(apiDate, json)
-              console.log('SectorRotation: 已保存数据到数据库', apiDate)
-              // 重新读取，拿到合并后的统计字段（maxUp/maxUpNum 等）
-              const updatedResult = await getPlateData(apiDate)
-              if (updatedResult) {
-                plateData = updatedResult.plateData
-                plateStats = updatedResult.stats || {}
-              }
-            } catch (saveError) {
-              console.warn('保存数据到数据库失败', apiDate, saveError)
-              // 即使保存失败，也继续使用数据
-            }
-          }
-        } catch (e) {
-          console.warn('网络请求失败', apiDate, e)
-        }
-      }
-
-      // 处理板块数据
-      if (plateData && Array.isArray(plateData) && plateData.length > 0) {
-        // filter out ST and '其他'
-        const plates = plateData
-          .filter(p => p.secu_name && !p.secu_name.startsWith('ST') && !p.secu_name.startsWith('*ST') && !p.secu_name.includes('其他'))
-          .map(p => ({ name: p.secu_name, change: p.change, raw: p }))
-          .sort((a, b) => (b.change ?? -Infinity) - (a.change ?? -Infinity))
-
-        if (plates.length > 0) {
-          // attach enriched fields (limitCount / maxUp / continuityRate) from DB stats or raw
-          const normalized = plates.map(p => {
-            const stats = plateStats?.[p.name] || {}
-            const raw = p.raw
-
-            const limitCount =
-              (raw?.plate_stock_up_num ?? stats?.plate_stock_up_num ?? extractLimitCount(raw) ?? 0)
-
-            const maxUp = raw?.maxUp ?? stats?.maxUp ?? null
-            const maxUpNum = raw?.maxUpNum ?? stats?.maxUpNum ?? null
-            const continuityRate = raw?.continuityRate ?? stats?.continuityRate ?? null
-            const limitStocks = extractLimitStockCodes(raw)
-
-            return {
-              name: p.name,
-              change: p.change,
-              limitCount,
-              maxUp,
-              maxUpNum,
-              continuityRate,
-              limitStocks
-            }
-          })
-          console.log('SectorRotation: normalized plates for', apiDate, normalized.slice(0, 6))
-          dateData.value.push({ date: apiDate, plates: normalized })
-        }
-      }
     }
 
-    dt = getPrevDate(dt)
-    attempts++
+    if (plateData?.length > 0) {
+      pushSectorDay(apiDate, plateData, plateStats)
+    } else {
+      needFetchDates.push(apiDate)
+    }
   }
-  
-  // 按照日期倒序排列（最新的在前）
+
+  if (needFetchDates.length > 0) {
+    let signature = null
+    try {
+      const firstUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=1&date=${needFetchDates[0]}`
+      signature = await getClsSignature(firstUrl)
+    } catch (e) {
+      console.warn('获取签名失败', e)
+      error.value = '获取签名失败'
+    }
+
+    for (const apiDate of needFetchDates) {
+      if (!signature) continue
+      try {
+        const json = await fetchPlateUpDownAnalysis({ date: apiDate, upLimit: 1, signature })
+        if (json?.data?.plate_stock?.length > 0) {
+          await extractAndSaveAllData(apiDate, json)
+          console.log('SectorRotation: 已保存数据到数据库', apiDate)
+          const updatedResult = await getPlateData(apiDate)
+          const plateData = updatedResult?.plateData || json.data.plate_stock
+          const plateStats = updatedResult?.stats || {}
+          pushSectorDay(apiDate, plateData, plateStats)
+        }
+      } catch (e) {
+        console.warn('网络请求失败', apiDate, e)
+      }
+    }
+  }
+
   dateData.value.sort((a, b) => b.date.localeCompare(a.date))
-
-  // 计算/补齐近 7 天连板率：先用 DB，DB 没有再计算并写回 DB
   await ensureContinuityRatesForSevenDays()
-
-  // compute frequency stats once we have all dateData
   computeNameCounts()
-
   loading.value = false
 }
 

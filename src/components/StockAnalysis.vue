@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
-import { initDB, extractAndSaveAllData } from '../utils/db.js'
+import { initDB, getPlateData, extractAndSaveAllData } from '../utils/db.js'
+import { getClsSignature, fetchPlateUpDownAnalysis, getTodayYYYYMMDD } from '../utils/clsApi.js'
 
 const props = defineProps({
   initialDate: {
@@ -31,62 +32,69 @@ const fetchStocks = async () => {
   try {
     loading.value = true
     error.value = null
-    
-    // Format date for API (YYYYMMDD)
+
     const apiDate = selectedDate.value.replace(/-/g, '')
     const upLimit = limitUpOnly.value ? 1 : 0
-    
-    const targetUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=${upLimit}&date=${apiDate}`
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
-    
-    // Cache Key
     const cacheKey = `STOCK_CACHE_${apiDate}_${upLimit}`
-    
-    try {
-      // 确保数据库已初始化
-      await initDB()
-      
-      const res = await fetch(proxyUrl)
-      const json = await res.json()
-      if (json.code === 200) {
-        stockData.value = json.data.plate_stock
-        ladderData.value = json.data.continuous_limit_up || []
-        isFromCache.value = false
-        
-        // Save to cache
-        localStorage.setItem(cacheKey, JSON.stringify({
-          plate_stock: json.data.plate_stock,
-          continuous_limit_up: json.data.continuous_limit_up,
-          timestamp: Date.now()
-        }))
-        
-        // 保存到数据库（拆解数据并保存到对应表）
-        try {
-          await extractAndSaveAllData(apiDate, json)
-          console.log('StockAnalysis: 已保存数据到数据库', apiDate)
-        } catch (saveError) {
-          console.warn('保存数据到数据库失败', apiDate, saveError)
-          // 即使保存失败，也继续使用数据
-        }
-      } else {
-        throw new Error('Data format error')
-      }
-    } catch (apiErr) {
-      console.warn('API fetch failed, trying cache...', apiErr)
+    const todayStr = getTodayYYYYMMDD()
+    const isToday = apiDate === todayStr
+
+    await initDB()
+
+    if (!isToday) {
       const cached = localStorage.getItem(cacheKey)
       if (cached) {
         const parsed = JSON.parse(cached)
-        stockData.value = parsed.plate_stock
+        stockData.value = parsed.plate_stock || []
         ladderData.value = parsed.continuous_limit_up || []
         isFromCache.value = true
-        error.value = null // Clear error if we have cache
-      } else {
-        error.value = '网络请求错误，且无缓存数据'
-        throw apiErr
+        loading.value = false
+        return
+      }
+      const plateResult = await getPlateData(apiDate)
+      if (plateResult?.plateData?.length > 0) {
+        stockData.value = plateResult.plateData
+        ladderData.value = []
+        isFromCache.value = true
+        loading.value = false
+        return
       }
     }
+
+    const targetUrl = `https://x-quote.cls.cn/v2/quote/a/plate/up_down_analysis?up_limit=${upLimit}&date=${apiDate}`
+    const signature = await getClsSignature(targetUrl)
+    const json = await fetchPlateUpDownAnalysis({ date: apiDate, upLimit, signature })
+
+    stockData.value = json.data.plate_stock || []
+    ladderData.value = json.data.continuous_limit_up || []
+    isFromCache.value = false
+
+    localStorage.setItem(cacheKey, JSON.stringify({
+      plate_stock: json.data.plate_stock,
+      continuous_limit_up: json.data.continuous_limit_up,
+      timestamp: Date.now()
+    }))
+
+    try {
+      await extractAndSaveAllData(apiDate, json)
+      console.log('StockAnalysis: 已保存数据到数据库', apiDate)
+    } catch (saveError) {
+      console.warn('保存数据到数据库失败', apiDate, saveError)
+    }
   } catch (e) {
-    console.error(e)
+    console.warn('StockAnalysis fetch failed', e)
+    error.value = '网络请求错误，且无缓存数据'
+    const apiDate = selectedDate.value.replace(/-/g, '')
+    const upLimit = limitUpOnly.value ? 1 : 0
+    const cacheKey = `STOCK_CACHE_${apiDate}_${upLimit}`
+    const cached = localStorage.getItem(cacheKey)
+    if (cached) {
+      const parsed = JSON.parse(cached)
+      stockData.value = parsed.plate_stock || []
+      ladderData.value = parsed.continuous_limit_up || []
+      isFromCache.value = true
+      error.value = null
+    }
   } finally {
     loading.value = false
   }
